@@ -34,12 +34,20 @@ struct buffered_update {
 #define IF_TYPE_WIRELESS 2
 #define IF_TYPE_TUNNEL 3
 
+/* Length of the Ed25519 public-key fingerprint carried in the packet trailer. */
+#define KEYID_LEN 8
+
 /* If you modify this structure, also modify the merge_ifconf function. */
 struct key {
     char *id;
     int type;
     int len;
     unsigned char *value;
+    /* For AUTH_TYPE_ED25519: an 8-byte fingerprint of the public key, carried
+       in the packet trailer so a receiver can pick the one verifying key in
+       O(1) instead of trial-verifying against every trusted key. Zero and
+       unused for the HMAC key types. */
+    unsigned char keyid[KEYID_LEN];
     unsigned short ref_count;
 };
 
