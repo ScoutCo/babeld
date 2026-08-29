@@ -112,6 +112,9 @@ add_key(char *id, int type, int len, unsigned char *value)
         key->type = type;
         key->len = len;
         key->value = value;
+        if(type == AUTH_TYPE_ED25519)
+            compute_keyid(len == ED25519_SECKEY_LEN ? value + 32 : value,
+                          key->keyid);
         return key;
     }
 
@@ -134,6 +137,9 @@ add_key(char *id, int type, int len, unsigned char *value)
     key->type = type;
     key->len = len;
     key->value = value;
+    if(type == AUTH_TYPE_ED25519)
+        compute_keyid(len == ED25519_SECKEY_LEN ? value + 32 : value,
+                      key->keyid);
 
     keys[numkeys++] = key;
     return key;
