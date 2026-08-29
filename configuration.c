@@ -1273,6 +1273,30 @@ parse_config_line(int c, gnc_t gnc, void *closure,
             goto fail;
         add_key(key->id, key->type, key->len, key->value);
         free(key);
+    } else if(strcmp(token, "ed25519-ca") == 0 ||
+              strcmp(token, "ed25519-cert") == 0 ||
+              strcmp(token, "ed25519-revoke") == 0) {
+        /* Babel-SIG CA trust: the fleet CA public key, this node's
+           certificate (CA signature over its own public key), and revoked
+           key ids. */
+        unsigned char *value = NULL;
+        int len = 0, expected;
+        expected = strcmp(token, "ed25519-ca") == 0 ? ED25519_PUBKEY_LEN
+                   : strcmp(token, "ed25519-cert") == 0 ? ED25519_CERT_LEN
+                   : KEYID_LEN;
+        c = gethex(c, &value, &len, gnc, closure);
+        if(c < -1 || value == NULL || len != expected) {
+            fprintf(stderr, "%s expects a %d-byte hex value.\n", token, expected);
+            free(value);
+            goto fail;
+        }
+        if(strcmp(token, "ed25519-ca") == 0)
+            set_ca_pubkey(value);
+        else if(strcmp(token, "ed25519-cert") == 0)
+            set_own_cert(value);
+        else
+            add_revoked_keyid(value);
+        free(value);
     } else {
         c = parse_option(c, gnc, closure, token);
         if(c < -1)
