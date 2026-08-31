@@ -776,6 +776,8 @@ parse_key(int c, gnc_t gnc, void *closure, struct key **key_return)
                 key->type = AUTH_TYPE_SHA256;
             } else if(strcmp(auth_type, "blake2s128") == 0) {
                 key->type = AUTH_TYPE_BLAKE2S128;
+            } else if(strcmp(auth_type, "ed25519") == 0) {
+                key->type = AUTH_TYPE_ED25519;
             } else {
                 fprintf(stderr, "Key type '%s' isn't supported.\n", auth_type);
                 free(auth_type);
@@ -824,6 +826,21 @@ parse_key(int c, gnc_t gnc, void *closure, struct key **key_return)
         if(key->len < 1 || key->len > 32) {
             fprintf(stderr, "Key length is %d, expected 1 to 32.\n",
                     key->len);
+            goto error;
+        }
+        break;
+    case AUTH_TYPE_ED25519:
+        /* A 64-byte value is a libsodium secret key (used to sign); a 32-byte
+           value is a public key (used to verify a trusted peer). The key id
+           carried on the wire is a fingerprint of the public key either way. */
+        if(key->len != ED25519_SECKEY_LEN && key->len != ED25519_PUBKEY_LEN) {
+            fprintf(stderr, "Ed25519 key length is %d, expected %d or %d.\n",
+                    key->len, ED25519_PUBKEY_LEN, ED25519_SECKEY_LEN);
+            goto error;
+        }
+        if(compute_keyid(key->len == ED25519_SECKEY_LEN ?
+                         key->value + 32 : key->value, key->keyid) != 0) {
+            fprintf(stderr, "Couldn't compute Ed25519 key id.\n");
             goto error;
         }
         break;

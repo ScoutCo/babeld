@@ -27,6 +27,8 @@ THE SOFTWARE.
 #include <sys/time.h>
 #include <netinet/in.h>
 
+#include <sodium.h>
+
 #include "rfc6234/sha.h"
 #include "BLAKE2/ref/blake2.h"
 
@@ -48,6 +50,37 @@ find_key(const char *id)
     for(i = 0; i < numkeys; i++) {
         if(strcmp(keys[i]->id, id) == 0)
             return retain_key(keys[i]);
+    }
+    return NULL;
+}
+
+/* The public key of an Ed25519 key. A signing key stores libsodium's 64-byte
+   secret key, whose second half is the public key; a verify-only key stores
+   the 32-byte public key directly. */
+static const unsigned char *
+ed25519_pubkey(const struct key *key)
+{
+    if(key->len == ED25519_SECKEY_LEN)
+        return key->value + 32;
+    return key->value;
+}
+
+/* An 8-byte fingerprint of a public key, used as the wire key id. */
+int
+compute_keyid(const unsigned char *pubkey, unsigned char *keyid_return)
+{
+    return crypto_generichash(keyid_return, KEYID_LEN,
+                              pubkey, ED25519_PUBKEY_LEN, NULL, 0);
+}
+
+struct key *
+find_key_by_keyid(const unsigned char *keyid)
+{
+    int i;
+    for(i = 0; i < numkeys; i++) {
+        if(keys[i]->type == AUTH_TYPE_ED25519 &&
+           memcmp(keys[i]->keyid, keyid, KEYID_LEN) == 0)
+            return keys[i];
     }
     return NULL;
 }
@@ -79,6 +112,9 @@ add_key(char *id, int type, int len, unsigned char *value)
         key->type = type;
         key->len = len;
         key->value = value;
+        if(type == AUTH_TYPE_ED25519)
+            compute_keyid(len == ED25519_SECKEY_LEN ? value + 32 : value,
+                          key->keyid);
         return key;
     }
 
@@ -101,6 +137,9 @@ add_key(char *id, int type, int len, unsigned char *value)
     key->type = type;
     key->len = len;
     key->value = value;
+    if(type == AUTH_TYPE_ED25519)
+        compute_keyid(len == ED25519_SECKEY_LEN ? value + 32 : value,
+                      key->keyid);
 
     keys[numkeys++] = key;
     return key;
@@ -207,6 +246,59 @@ compute_hmac(const unsigned char *src, const unsigned char *dst,
     }
 }
 
+/* The bytes an Ed25519 signature covers: the same pseudo-header the HMAC
+   types authenticate (source and destination address and port), then the
+   4-byte packet header, then the packet body. Returns a malloc'd buffer and
+   its length, or NULL on failure. */
+static unsigned char *
+build_signed_region(const unsigned char *src, const unsigned char *dst,
+                    const unsigned char *packet_header,
+                    const unsigned char *body, int bodylen, int *len_return)
+{
+    unsigned char port[2];
+    int len = 16 + 2 + 16 + 2 + 4 + bodylen;
+    unsigned char *region = malloc(len);
+    int o = 0;
+
+    if(region == NULL)
+        return NULL;
+    DO_HTONS(port, (unsigned short)protocol_port);
+    memcpy(region + o, src, 16); o += 16;
+    memcpy(region + o, port, 2); o += 2;
+    memcpy(region + o, dst, 16); o += 16;
+    memcpy(region + o, port, 2); o += 2;
+    memcpy(region + o, packet_header, 4); o += 4;
+    memcpy(region + o, body, bodylen); o += bodylen;
+    *len_return = o;
+    return region;
+}
+
+/* Ed25519 trailer value: KEYID_LEN-byte key id followed by a 64-byte
+   signature over build_signed_region(). Returns the value length or -1. */
+static int
+sign_ed25519(const unsigned char *src, const unsigned char *dst,
+             const unsigned char *packet_header,
+             const unsigned char *body, int bodylen, struct key *key,
+             unsigned char *value_return)
+{
+    unsigned char *region;
+    int regionlen, rc;
+
+    if(key->len != ED25519_SECKEY_LEN)
+        return -1;
+    region = build_signed_region(src, dst, packet_header, body, bodylen,
+                                 &regionlen);
+    if(region == NULL)
+        return -1;
+    memcpy(value_return, key->keyid, KEYID_LEN);
+    rc = crypto_sign_ed25519_detached(value_return + KEYID_LEN, NULL,
+                                      region, regionlen, key->value);
+    free(region);
+    if(rc != 0)
+        return -1;
+    return KEYID_LEN + ED25519_SIG_LEN;
+}
+
 int
 add_hmac(struct buffered *buf, struct interface *ifp,
          unsigned char *packet_header)
@@ -227,9 +319,14 @@ add_hmac(struct buffered *buf, struct interface *ifp,
         return -1;
     }
 
-    hmaclen = compute_hmac(src, dst, packet_header,
-                           buf->buf, buf->len, ifp->key,
-                           buf->buf + i + 2);
+    if(ifp->key->type == AUTH_TYPE_ED25519)
+        hmaclen = sign_ed25519(src, dst, packet_header,
+                               buf->buf, buf->len, ifp->key,
+                               buf->buf + i + 2);
+    else
+        hmaclen = compute_hmac(src, dst, packet_header,
+                               buf->buf, buf->len, ifp->key,
+                               buf->buf + i + 2);
     if(hmaclen < 0)
         return -1;
     buf->buf[i++] = MESSAGE_MAC;
@@ -252,6 +349,37 @@ compare_hmac(const unsigned char *src, const unsigned char *dst,
     return len == hmaclen && (memcmp(buf, hmac, hmaclen) == 0);
 }
 
+/* Verify one Ed25519 trailer value = [keyid][signature]. The signer is
+   identified by the key id, not by any interface configuration, so a receiver
+   can authenticate a multicast packet from any trusted peer with a single
+   verification. Returns 1 on a good signature from a trusted key, else 0. */
+static int
+verify_ed25519(const unsigned char *src, const unsigned char *dst,
+               const unsigned char *packet, int bodylen,
+               const unsigned char *value, int valuelen)
+{
+    struct key *key;
+    unsigned char *region;
+    int regionlen, rc;
+
+    if(valuelen != KEYID_LEN + ED25519_SIG_LEN)
+        return 0;
+    key = find_key_by_keyid(value);
+    if(key == NULL) {
+        debugf("Signature from unknown key id.\n");
+        return 0;
+    }
+    region = build_signed_region(src, dst, packet, packet + 4, bodylen,
+                                 &regionlen);
+    if(region == NULL)
+        return 0;
+    rc = crypto_sign_ed25519_verify_detached(value + KEYID_LEN,
+                                             region, regionlen,
+                                             ed25519_pubkey(key));
+    free(region);
+    return rc == 0;
+}
+
 int
 check_hmac(const unsigned char *packet, int packetlen, int bodylen,
            const unsigned char *src, const unsigned char *dst,
@@ -260,6 +388,7 @@ check_hmac(const unsigned char *packet, int packetlen, int bodylen,
     int i = bodylen + 4;
     int len;
     int rc = -1;
+    int ed25519 = (ifp->key != NULL && ifp->key->type == AUTH_TYPE_ED25519);
 
     debugf("check_hmac %s -> %s\n",
            format_address(src), format_address(dst));
@@ -275,8 +404,12 @@ check_hmac(const unsigned char *packet, int packetlen, int bodylen,
                 fprintf(stderr, "Received truncated message.\n");
                 return -1;
             }
-            ok = compare_hmac(src, dst, packet, bodylen,
-                              packet + i + 2, len, ifp->key);
+            if(ed25519)
+                ok = verify_ed25519(src, dst, packet, bodylen,
+                                    packet + i + 2, len);
+            else
+                ok = compare_hmac(src, dst, packet, bodylen,
+                                  packet + i + 2, len, ifp->key);
             if(ok)
                 return 1;
             rc = 0;

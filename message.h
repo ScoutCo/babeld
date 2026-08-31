@@ -21,7 +21,9 @@ THE SOFTWARE.
 */
 
 #define MAX_BUFFERED_UPDATES 200
-#define MAX_HMAC_SPACE 48
+/* Room reserved for the auth trailer TLV: 2-byte TLV header + the widest
+   value. Ed25519 (8-byte keyid + 64-byte sig = 72) is the largest. */
+#define MAX_HMAC_SPACE 80
 
 #define MESSAGE_PAD1 0
 #define MESSAGE_PADN 1
