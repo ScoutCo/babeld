@@ -58,6 +58,10 @@ THE SOFTWARE.
 #define MESSAGE_CERT_FRAG 21
 #define MESSAGE_SIG_SESSION 22
 #define MESSAGE_CERT_REQUEST 23
+/* SIG_NET - cert-less session binding: long-term pubkey + ephemeral key + its
+   authorization, with no certificate. Provides packet integrity and, via the
+   network name folded into the authorization, network-name scoping. */
+#define MESSAGE_SIG_NET 24
 
 /* Protocol extension through sub-TLVs. */
 #define SUBTLV_PAD1 0

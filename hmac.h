@@ -48,6 +48,18 @@ THE SOFTWARE.
 #define ED25519_SIGCERT_LEN \
     (ED25519_PUBKEY_LEN + ED25519_CERT_LEN + ED25519_PUBKEY_LEN + ED25519_SIG_LEN)
 
+/* SIG_NET trailer value (cert-less mode): a session binding with no CA/cert.
+     long_term_pubkey || eph_pubkey || eph_auth               = 128
+   Membership is open; this provides packet integrity plus network-name scoping.
+   eph_auth is the long-term key's signature over eph_pubkey followed by the
+   configured network name, so a session only verifies for a peer that shares
+   the same network name (the name itself never travels on the wire). */
+#define ED25519_SIGNET_LEN \
+    (ED25519_PUBKEY_LEN + ED25519_PUBKEY_LEN + ED25519_SIG_LEN)
+
+/* Longest network name bound into an ephemeral authorization. */
+#define MAX_NETWORK_NAME 64
+
 /* Widest trailer value across all auth types (HMAC-SHA256 is 32). */
 #define MAX_DIGEST_LEN ED25519_SIGCERT_LEN
 
@@ -58,6 +70,10 @@ void set_ed25519_ephemeral(void);
 /* Opt in to on-demand certificate pull (X.509 mode): serve the cert only when
    a peer sends a CERT_REQUEST, rather than pushing it periodically in Hellos. */
 void set_ed25519_cert_pull(void);
+/* Set the network name bound into ephemeral authorizations. In cert-less mode
+   it scopes peering (only same-named nodes verify); it is also folded into the
+   authorization in the CA/X.509 modes when set. Empty name = no scoping. */
+void set_ed25519_network_name(const char *name);
 int add_revoked_keyid(const unsigned char *keyid);
 
 /* X.509 identity mode (phase 3): the CA and own certificate, in DER. When
