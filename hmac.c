@@ -72,6 +72,61 @@ set_ed25519_ephemeral(void)
     ephemeral_enabled = 1;
 }
 
+/* Session cache: validated ephemeral keys, so that steady-state packets can
+   carry only the small MAC (ephemeral keyid || sig) while the trust chain
+   travels in Hellos. Keyed by the ephemeral keyid; the long-term keyid is
+   kept so a revocation that lands after caching is still honored. */
+static int keyid_revoked(const unsigned char *keyid);
+
+#define MAX_SESSIONS 512
+struct session {
+    unsigned char eph_keyid[KEYID_LEN];
+    unsigned char eph_pubkey[ED25519_PUBKEY_LEN];
+    unsigned char lt_keyid[KEYID_LEN];
+    int used;
+};
+static struct session sessions[MAX_SESSIONS];
+static int session_rr = 0;
+
+static void
+session_upsert(const unsigned char *eph_keyid, const unsigned char *eph_pubkey,
+               const unsigned char *lt_keyid)
+{
+    int i, slot = -1;
+    for(i = 0; i < MAX_SESSIONS; i++) {
+        if(sessions[i].used &&
+           memcmp(sessions[i].eph_keyid, eph_keyid, KEYID_LEN) == 0) {
+            slot = i;
+            break;
+        }
+        if(slot < 0 && !sessions[i].used)
+            slot = i;
+    }
+    if(slot < 0)
+        slot = session_rr++ % MAX_SESSIONS; /* table full: evict round-robin */
+    memcpy(sessions[slot].eph_keyid, eph_keyid, KEYID_LEN);
+    memcpy(sessions[slot].eph_pubkey, eph_pubkey, ED25519_PUBKEY_LEN);
+    memcpy(sessions[slot].lt_keyid, lt_keyid, KEYID_LEN);
+    sessions[slot].used = 1;
+}
+
+/* Return a cached ephemeral public key for eph_keyid, or NULL if unknown or
+   its identity has since been revoked. */
+static const unsigned char *
+session_lookup(const unsigned char *eph_keyid)
+{
+    int i;
+    for(i = 0; i < MAX_SESSIONS; i++) {
+        if(sessions[i].used &&
+           memcmp(sessions[i].eph_keyid, eph_keyid, KEYID_LEN) == 0) {
+            if(keyid_revoked(sessions[i].lt_keyid))
+                return NULL;
+            return sessions[i].eph_pubkey;
+        }
+    }
+    return NULL;
+}
+
 /* Mint the ephemeral keypair and have the long-term key authorize it. */
 static int
 ensure_ephemeral(const struct key *longterm)
@@ -432,6 +487,28 @@ build_sig_cert(struct key *key, unsigned char *value_return)
     return o;
 }
 
+/* Does the packet body contain a Hello TLV? The trust chain is attached only
+   to such packets, so it travels at Hello cadence rather than on every
+   packet. */
+static int
+body_has_hello(const unsigned char *body, int bodylen)
+{
+    int i = 0;
+    while(i < bodylen) {
+        int type = body[i];
+        if(type == MESSAGE_PAD1) {
+            i++;
+            continue;
+        }
+        if(i + 2 > bodylen)
+            break;
+        if(type == MESSAGE_HELLO)
+            return 1;
+        i += 2 + body[i + 1];
+    }
+    return 0;
+}
+
 int
 add_hmac(struct buffered *buf, struct interface *ifp,
          unsigned char *packet_header)
@@ -453,8 +530,11 @@ add_hmac(struct buffered *buf, struct interface *ifp,
     }
 
     /* Ephemeral mode emits the trust chain in a companion SIG_CERT TLV ahead
-       of the MAC TLV. */
-    if(ifp->key->type == AUTH_TYPE_ED25519 && own_cert_set && ephemeral_enabled) {
+       of the MAC TLV — but only on packets carrying a Hello, so it travels at
+       Hello cadence. Receivers cache the validated ephemeral key and verify
+       the small MAC on all other packets against that cache. */
+    if(ifp->key->type == AUTH_TYPE_ED25519 && own_cert_set && ephemeral_enabled &&
+       body_has_hello(buf->buf, buf->len)) {
         int certlen = build_sig_cert(ifp->key, buf->buf + i + 2);
         if(certlen < 0)
             return -1;
@@ -552,6 +632,13 @@ validate_sig_cert(const unsigned char *value, int valuelen,
         debugf("Ephemeral key not authorized by the long-term key.\n");
         return 0;
     }
+    /* Cache the validated ephemeral key so later MAC-only packets from this
+       session need not re-carry the chain. */
+    {
+        unsigned char eph_keyid[KEYID_LEN];
+        if(compute_keyid(eph_pubkey, eph_keyid) == 0)
+            session_upsert(eph_keyid, eph_pubkey, keyid);
+    }
     memcpy(eph_pubkey_return, eph_pubkey, ED25519_PUBKEY_LEN);
     return 1;
 }
@@ -603,6 +690,9 @@ verify_ed25519(const unsigned char *src, const unsigned char *dst,
     }
 
     if(valuelen == ED25519_TRAILER_V1_LEN) {
+        struct key *key;
+        const unsigned char *cached;
+        /* Ephemeral key vouched for by a SIG_CERT in this same packet... */
         if(have_eph) {
             unsigned char eph_keyid[KEYID_LEN];
             if(compute_keyid(eph_pubkey, eph_keyid) == 0 &&
@@ -610,7 +700,13 @@ verify_ed25519(const unsigned char *src, const unsigned char *dst,
                 return verify_ed25519_sig(src, dst, packet, bodylen,
                                           value + KEYID_LEN, eph_pubkey);
         }
-        struct key *key = find_key_by_keyid(value);
+        /* ...or an ephemeral key cached from an earlier Hello's chain. */
+        cached = session_lookup(value);
+        if(cached != NULL)
+            return verify_ed25519_sig(src, dst, packet, bodylen,
+                                      value + KEYID_LEN, cached);
+        /* ...or a preconfigured trusted key (phase 1). */
+        key = find_key_by_keyid(value);
         if(key == NULL) {
             debugf("Signature from unknown key id.\n");
             return 0;
