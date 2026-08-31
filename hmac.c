@@ -43,6 +43,55 @@ THE SOFTWARE.
 struct key **keys = NULL;
 int numkeys = 0, maxkeys = 0;
 
+/* CA-trust state (Babel-SIG phase 2a). A node needs only the fleet CA public
+   key plus its own CA-signed certificate; peers are trusted because the CA
+   vouches for the public key they carry in each packet, not because they are
+   preconfigured. */
+static unsigned char ca_pubkey[ED25519_PUBKEY_LEN];
+static int ca_set = 0;
+static unsigned char own_cert[ED25519_CERT_LEN];
+static int own_cert_set = 0;
+/* Revoked key ids (a minimal CRL). */
+static unsigned char (*revoked_keyids)[KEYID_LEN] = NULL;
+static int num_revoked = 0;
+
+void
+set_ca_pubkey(const unsigned char *pubkey)
+{
+    memcpy(ca_pubkey, pubkey, ED25519_PUBKEY_LEN);
+    ca_set = 1;
+}
+
+void
+set_own_cert(const unsigned char *cert)
+{
+    memcpy(own_cert, cert, ED25519_CERT_LEN);
+    own_cert_set = 1;
+}
+
+int
+add_revoked_keyid(const unsigned char *keyid)
+{
+    unsigned char (*new_revoked)[KEYID_LEN];
+    new_revoked = realloc(revoked_keyids, (num_revoked + 1) * KEYID_LEN);
+    if(new_revoked == NULL)
+        return -1;
+    revoked_keyids = new_revoked;
+    memcpy(revoked_keyids[num_revoked++], keyid, KEYID_LEN);
+    return 0;
+}
+
+static int
+keyid_revoked(const unsigned char *keyid)
+{
+    int i;
+    for(i = 0; i < num_revoked; i++) {
+        if(memcmp(revoked_keyids[i], keyid, KEYID_LEN) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 struct key *
 find_key(const char *id)
 {
@@ -273,8 +322,11 @@ build_signed_region(const unsigned char *src, const unsigned char *dst,
     return region;
 }
 
-/* Ed25519 trailer value: KEYID_LEN-byte key id followed by a 64-byte
-   signature over build_signed_region(). Returns the value length or -1. */
+/* Ed25519 trailer value. With a CA certificate configured, the layout is
+   keyid || pubkey || cert || sig (V2): the signer's public key and its CA
+   signature travel with every packet so a receiver needs only the CA to
+   trust it. Without a cert it is keyid || sig (V1), verified against a
+   preconfigured trusted key. Returns the value length or -1. */
 static int
 sign_ed25519(const unsigned char *src, const unsigned char *dst,
              const unsigned char *packet_header,
@@ -282,7 +334,7 @@ sign_ed25519(const unsigned char *src, const unsigned char *dst,
              unsigned char *value_return)
 {
     unsigned char *region;
-    int regionlen, rc;
+    int regionlen, rc, o = 0;
 
     if(key->len != ED25519_SECKEY_LEN)
         return -1;
@@ -290,13 +342,21 @@ sign_ed25519(const unsigned char *src, const unsigned char *dst,
                                  &regionlen);
     if(region == NULL)
         return -1;
-    memcpy(value_return, key->keyid, KEYID_LEN);
-    rc = crypto_sign_ed25519_detached(value_return + KEYID_LEN, NULL,
+
+    memcpy(value_return + o, key->keyid, KEYID_LEN);
+    o += KEYID_LEN;
+    if(own_cert_set) {
+        memcpy(value_return + o, key->value + 32, ED25519_PUBKEY_LEN);
+        o += ED25519_PUBKEY_LEN;
+        memcpy(value_return + o, own_cert, ED25519_CERT_LEN);
+        o += ED25519_CERT_LEN;
+    }
+    rc = crypto_sign_ed25519_detached(value_return + o, NULL,
                                       region, regionlen, key->value);
     free(region);
     if(rc != 0)
         return -1;
-    return KEYID_LEN + ED25519_SIG_LEN;
+    return o + ED25519_SIG_LEN;
 }
 
 int
@@ -349,35 +409,85 @@ compare_hmac(const unsigned char *src, const unsigned char *dst,
     return len == hmaclen && (memcmp(buf, hmac, hmaclen) == 0);
 }
 
-/* Verify one Ed25519 trailer value = [keyid][signature]. The signer is
-   identified by the key id, not by any interface configuration, so a receiver
-   can authenticate a multicast packet from any trusted peer with a single
-   verification. Returns 1 on a good signature from a trusted key, else 0. */
+/* Verify the actual Ed25519 signature over the packet, given the signer's
+   public key. Returns 1 on success. */
+static int
+verify_ed25519_sig(const unsigned char *src, const unsigned char *dst,
+                   const unsigned char *packet, int bodylen,
+                   const unsigned char *sig, const unsigned char *pubkey)
+{
+    unsigned char *region;
+    int regionlen, rc;
+
+    region = build_signed_region(src, dst, packet, packet + 4, bodylen,
+                                 &regionlen);
+    if(region == NULL)
+        return 0;
+    rc = crypto_sign_ed25519_verify_detached(sig, region, regionlen, pubkey);
+    free(region);
+    return rc == 0;
+}
+
+/* Verify one Ed25519 trailer value. Two layouts are accepted:
+
+   V2 (CA trust): keyid || pubkey || cert || sig. The public key travels in
+   the packet and is trusted because `cert` is the CA's signature over it, so
+   no per-peer configuration is needed. keyid must match the public key (it is
+   its fingerprint, and the unit of revocation).
+
+   V1 (preconfigured): keyid || sig, verified against a trusted key looked up
+   by keyid.
+
+   Returns 1 on a good signature from an authorized signer, else 0. */
 static int
 verify_ed25519(const unsigned char *src, const unsigned char *dst,
                const unsigned char *packet, int bodylen,
                const unsigned char *value, int valuelen)
 {
-    struct key *key;
-    unsigned char *region;
-    int regionlen, rc;
+    if(valuelen == ED25519_TRAILER_V2_LEN) {
+        const unsigned char *keyid = value;
+        const unsigned char *pubkey = value + KEYID_LEN;
+        const unsigned char *cert = pubkey + ED25519_PUBKEY_LEN;
+        const unsigned char *sig = cert + ED25519_CERT_LEN;
+        unsigned char expected_keyid[KEYID_LEN];
 
-    if(valuelen != KEYID_LEN + ED25519_SIG_LEN)
-        return 0;
-    key = find_key_by_keyid(value);
-    if(key == NULL) {
-        debugf("Signature from unknown key id.\n");
-        return 0;
+        if(!ca_set) {
+            debugf("CA-trust packet but no CA configured.\n");
+            return 0;
+        }
+        if(keyid_revoked(keyid)) {
+            debugf("Signature from revoked key id.\n");
+            return 0;
+        }
+        /* The keyid must be the fingerprint of the carried public key, so a
+           revocation by keyid cannot be dodged by presenting a mismatched
+           pubkey. */
+        if(compute_keyid(pubkey, expected_keyid) != 0 ||
+           memcmp(keyid, expected_keyid, KEYID_LEN) != 0) {
+            debugf("Key id does not match public key.\n");
+            return 0;
+        }
+        /* The certificate is the CA's signature over the public key. */
+        if(crypto_sign_ed25519_verify_detached(cert, pubkey,
+                                               ED25519_PUBKEY_LEN,
+                                               ca_pubkey) != 0) {
+            debugf("Certificate not signed by the configured CA.\n");
+            return 0;
+        }
+        return verify_ed25519_sig(src, dst, packet, bodylen, sig, pubkey);
     }
-    region = build_signed_region(src, dst, packet, packet + 4, bodylen,
-                                 &regionlen);
-    if(region == NULL)
-        return 0;
-    rc = crypto_sign_ed25519_verify_detached(value + KEYID_LEN,
-                                             region, regionlen,
-                                             ed25519_pubkey(key));
-    free(region);
-    return rc == 0;
+
+    if(valuelen == ED25519_TRAILER_V1_LEN) {
+        struct key *key = find_key_by_keyid(value);
+        if(key == NULL) {
+            debugf("Signature from unknown key id.\n");
+            return 0;
+        }
+        return verify_ed25519_sig(src, dst, packet, bodylen,
+                                  value + KEYID_LEN, ed25519_pubkey(key));
+    }
+
+    return 0;
 }
 
 int
