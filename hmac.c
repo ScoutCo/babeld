@@ -55,6 +55,44 @@ static int own_cert_set = 0;
 static unsigned char (*revoked_keyids)[KEYID_LEN] = NULL;
 static int num_revoked = 0;
 
+/* Ephemeral session key (Babel-SIG phase 2b). When enabled, the node mints an
+   ephemeral keypair at first use and the long-term key authorizes it once
+   (eph_auth); packets are then signed by the ephemeral key so the long-term
+   identity key never appears in the per-packet hot path. A restart mints a
+   fresh ephemeral, giving a new session for free. */
+static int ephemeral_enabled = 0;
+static int have_ephemeral = 0;
+static unsigned char ephemeral_sk[ED25519_SECKEY_LEN];
+static unsigned char ephemeral_auth[ED25519_SIG_LEN];
+static unsigned char ephemeral_keyid[KEYID_LEN];
+
+void
+set_ed25519_ephemeral(void)
+{
+    ephemeral_enabled = 1;
+}
+
+/* Mint the ephemeral keypair and have the long-term key authorize it. */
+static int
+ensure_ephemeral(const struct key *longterm)
+{
+    unsigned char ephemeral_pk[ED25519_PUBKEY_LEN];
+    if(have_ephemeral)
+        return 0;
+    if(longterm->len != ED25519_SECKEY_LEN)
+        return -1;
+    if(crypto_sign_ed25519_keypair(ephemeral_pk, ephemeral_sk) != 0)
+        return -1;
+    if(crypto_sign_ed25519_detached(ephemeral_auth, NULL,
+                                    ephemeral_pk, ED25519_PUBKEY_LEN,
+                                    longterm->value) != 0)
+        return -1;
+    if(compute_keyid(ephemeral_pk, ephemeral_keyid) != 0)
+        return -1;
+    have_ephemeral = 1;
+    return 0;
+}
+
 void
 set_ca_pubkey(const unsigned char *pubkey)
 {
@@ -343,20 +381,55 @@ sign_ed25519(const unsigned char *src, const unsigned char *dst,
     if(region == NULL)
         return -1;
 
-    memcpy(value_return + o, key->keyid, KEYID_LEN);
-    o += KEYID_LEN;
-    if(own_cert_set) {
-        memcpy(value_return + o, key->value + 32, ED25519_PUBKEY_LEN);
-        o += ED25519_PUBKEY_LEN;
-        memcpy(value_return + o, own_cert, ED25519_CERT_LEN);
-        o += ED25519_CERT_LEN;
+    if(own_cert_set && ephemeral_enabled) {
+        /* Ephemeral: the MAC value is keyid(ephemeral) || sig(ephemeral). The
+           trust chain travels separately in a SIG_CERT trailer TLV (the full
+           chain would exceed babeld's 255-byte trailer). */
+        if(ensure_ephemeral(key) != 0) {
+            free(region);
+            return -1;
+        }
+        memcpy(value_return, ephemeral_keyid, KEYID_LEN);
+        o = KEYID_LEN;
+        rc = crypto_sign_ed25519_detached(value_return + o, NULL,
+                                          region, regionlen, ephemeral_sk);
+    } else {
+        memcpy(value_return, key->keyid, KEYID_LEN);
+        o = KEYID_LEN;
+        if(own_cert_set) {
+            /* V2: long-term key travels with its CA cert. */
+            memcpy(value_return + o, key->value + 32, ED25519_PUBKEY_LEN);
+            o += ED25519_PUBKEY_LEN;
+            memcpy(value_return + o, own_cert, ED25519_CERT_LEN);
+            o += ED25519_CERT_LEN;
+        }
+        rc = crypto_sign_ed25519_detached(value_return + o, NULL,
+                                          region, regionlen, key->value);
     }
-    rc = crypto_sign_ed25519_detached(value_return + o, NULL,
-                                      region, regionlen, key->value);
     free(region);
     if(rc != 0)
         return -1;
     return o + ED25519_SIG_LEN;
+}
+
+/* Write the SIG_CERT trailer value: the ephemeral trust chain
+   long_term_pubkey || cert || eph_pubkey || eph_auth. Requires a minted
+   ephemeral key. Returns the length or -1. */
+static int
+build_sig_cert(struct key *key, unsigned char *value_return)
+{
+    int o = 0;
+    if(ensure_ephemeral(key) != 0)
+        return -1;
+    memcpy(value_return + o, key->value + 32, ED25519_PUBKEY_LEN);
+    o += ED25519_PUBKEY_LEN;
+    memcpy(value_return + o, own_cert, ED25519_CERT_LEN);
+    o += ED25519_CERT_LEN;
+    memcpy(value_return + o, ephemeral_sk + 32, ED25519_PUBKEY_LEN);
+    o += ED25519_PUBKEY_LEN;
+    memcpy(value_return + o, ephemeral_auth, ED25519_SIG_LEN);
+    o += ED25519_SIG_LEN;
+    return o;
 }
 
 int
@@ -374,9 +447,20 @@ add_hmac(struct buffered *buf, struct interface *ifp,
     }
     src = ifp->ll[0];
 
-    if(buf->len + 2 + MAX_DIGEST_LEN > buf->size) {
+    if(buf->len + 2 + MAX_DIGEST_LEN + 2 + MAX_DIGEST_LEN > buf->size) {
         fprintf(stderr, "Buffer overflow in add_hmac.\n");
         return -1;
+    }
+
+    /* Ephemeral mode emits the trust chain in a companion SIG_CERT TLV ahead
+       of the MAC TLV. */
+    if(ifp->key->type == AUTH_TYPE_ED25519 && own_cert_set && ephemeral_enabled) {
+        int certlen = build_sig_cert(ifp->key, buf->buf + i + 2);
+        if(certlen < 0)
+            return -1;
+        buf->buf[i++] = MESSAGE_SIG_CERT;
+        buf->buf[i++] = certlen;
+        i += certlen;
     }
 
     if(ifp->key->type == AUTH_TYPE_ED25519)
@@ -428,21 +512,66 @@ verify_ed25519_sig(const unsigned char *src, const unsigned char *dst,
     return rc == 0;
 }
 
-/* Verify one Ed25519 trailer value. Two layouts are accepted:
+/* Validate a SIG_CERT trailer value (the ephemeral trust chain
+   long_term_pubkey || cert || eph_pubkey || eph_auth): the long-term key is
+   CA-certified and not revoked, and it authorized the ephemeral key. On
+   success copies the trusted ephemeral public key to eph_pubkey_return and
+   returns 1. */
+static int
+validate_sig_cert(const unsigned char *value, int valuelen,
+                  unsigned char *eph_pubkey_return)
+{
+    const unsigned char *pubkey = value;
+    const unsigned char *cert = pubkey + ED25519_PUBKEY_LEN;
+    const unsigned char *eph_pubkey = cert + ED25519_CERT_LEN;
+    const unsigned char *eph_auth = eph_pubkey + ED25519_PUBKEY_LEN;
+    unsigned char keyid[KEYID_LEN];
 
-   V2 (CA trust): keyid || pubkey || cert || sig. The public key travels in
-   the packet and is trusted because `cert` is the CA's signature over it, so
-   no per-peer configuration is needed. keyid must match the public key (it is
-   its fingerprint, and the unit of revocation).
+    if(valuelen != ED25519_SIGCERT_LEN)
+        return 0;
+    if(!ca_set) {
+        debugf("CA-trust packet but no CA configured.\n");
+        return 0;
+    }
+    /* Revocation is by identity: the long-term key's fingerprint. */
+    if(compute_keyid(pubkey, keyid) != 0)
+        return 0;
+    if(keyid_revoked(keyid)) {
+        debugf("Signature chain from revoked key id.\n");
+        return 0;
+    }
+    /* cert = CA's signature over the long-term key. */
+    if(crypto_sign_ed25519_verify_detached(cert, pubkey, ED25519_PUBKEY_LEN,
+                                           ca_pubkey) != 0) {
+        debugf("Certificate not signed by the configured CA.\n");
+        return 0;
+    }
+    /* eph_auth = long-term key's authorization of the ephemeral key. */
+    if(crypto_sign_ed25519_verify_detached(eph_auth, eph_pubkey,
+                                           ED25519_PUBKEY_LEN, pubkey) != 0) {
+        debugf("Ephemeral key not authorized by the long-term key.\n");
+        return 0;
+    }
+    memcpy(eph_pubkey_return, eph_pubkey, ED25519_PUBKEY_LEN);
+    return 1;
+}
 
-   V1 (preconfigured): keyid || sig, verified against a trusted key looked up
-   by keyid.
+/* Verify one MAC trailer value. Layouts, by length:
+
+   V2 (CA trust): keyid || pubkey || cert || sig — the long-term key signs and
+   travels with its CA certificate.
+
+   V1 (72): keyid || sig. If a SIG_CERT in the same packet vouched for an
+   ephemeral key whose fingerprint matches keyid, verify with that ephemeral
+   key (phase 2b). Otherwise verify against a preconfigured trusted key
+   (phase 1).
 
    Returns 1 on a good signature from an authorized signer, else 0. */
 static int
 verify_ed25519(const unsigned char *src, const unsigned char *dst,
                const unsigned char *packet, int bodylen,
-               const unsigned char *value, int valuelen)
+               const unsigned char *value, int valuelen,
+               const unsigned char *eph_pubkey, int have_eph)
 {
     if(valuelen == ED25519_TRAILER_V2_LEN) {
         const unsigned char *keyid = value;
@@ -459,15 +588,11 @@ verify_ed25519(const unsigned char *src, const unsigned char *dst,
             debugf("Signature from revoked key id.\n");
             return 0;
         }
-        /* The keyid must be the fingerprint of the carried public key, so a
-           revocation by keyid cannot be dodged by presenting a mismatched
-           pubkey. */
         if(compute_keyid(pubkey, expected_keyid) != 0 ||
            memcmp(keyid, expected_keyid, KEYID_LEN) != 0) {
             debugf("Key id does not match public key.\n");
             return 0;
         }
-        /* The certificate is the CA's signature over the public key. */
         if(crypto_sign_ed25519_verify_detached(cert, pubkey,
                                                ED25519_PUBKEY_LEN,
                                                ca_pubkey) != 0) {
@@ -478,6 +603,13 @@ verify_ed25519(const unsigned char *src, const unsigned char *dst,
     }
 
     if(valuelen == ED25519_TRAILER_V1_LEN) {
+        if(have_eph) {
+            unsigned char eph_keyid[KEYID_LEN];
+            if(compute_keyid(eph_pubkey, eph_keyid) == 0 &&
+               memcmp(value, eph_keyid, KEYID_LEN) == 0)
+                return verify_ed25519_sig(src, dst, packet, bodylen,
+                                          value + KEYID_LEN, eph_pubkey);
+        }
         struct key *key = find_key_by_keyid(value);
         if(key == NULL) {
             debugf("Signature from unknown key id.\n");
@@ -495,14 +627,33 @@ check_hmac(const unsigned char *packet, int packetlen, int bodylen,
            const unsigned char *src, const unsigned char *dst,
            struct interface *ifp)
 {
-    int i = bodylen + 4;
+    int i;
     int len;
     int rc = -1;
     int ed25519 = (ifp->key != NULL && ifp->key->type == AUTH_TYPE_ED25519);
+    unsigned char eph_pubkey[ED25519_PUBKEY_LEN];
+    int have_eph = 0;
 
     debugf("check_hmac %s -> %s\n",
            format_address(src), format_address(dst));
-    while(i < packetlen) {
+
+    /* First pass: a SIG_CERT trailer establishes a trusted ephemeral key for
+       the MAC in the same packet. */
+    if(ed25519) {
+        for(i = bodylen + 4; i + 2 <= packetlen; i += len + 2) {
+            len = packet[i + 1];
+            if(i + len + 2 > packetlen)
+                break;
+            if(packet[i] == MESSAGE_SIG_CERT) {
+                if(validate_sig_cert(packet + i + 2, len, eph_pubkey)) {
+                    have_eph = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    for(i = bodylen + 4; i < packetlen; i += len + 2) {
         if(i + 2 > packetlen) {
             fprintf(stderr, "Received truncated message.\n");
             break;
@@ -516,7 +667,7 @@ check_hmac(const unsigned char *packet, int packetlen, int bodylen,
             }
             if(ed25519)
                 ok = verify_ed25519(src, dst, packet, bodylen,
-                                    packet + i + 2, len);
+                                    packet + i + 2, len, eph_pubkey, have_eph);
             else
                 ok = compare_hmac(src, dst, packet, bodylen,
                                   packet + i + 2, len, ifp->key);
@@ -524,7 +675,6 @@ check_hmac(const unsigned char *packet, int packetlen, int bodylen,
                 return 1;
             rc = 0;
         }
-        i += len + 2;
     }
     return rc;
 }

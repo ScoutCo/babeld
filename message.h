@@ -22,8 +22,8 @@ THE SOFTWARE.
 
 #define MAX_BUFFERED_UPDATES 200
 /* Room reserved for the auth trailer TLV: 2-byte TLV header + the widest
-   value (the 168-byte CA-trust Ed25519 trailer). */
-#define MAX_HMAC_SPACE 176
+   value (the 264-byte ephemeral-session Ed25519 trailer). */
+#define MAX_HMAC_SPACE 272
 
 #define MESSAGE_PAD1 0
 #define MESSAGE_PADN 1
@@ -41,6 +41,9 @@ THE SOFTWARE.
 #define MESSAGE_PC 17
 #define MESSAGE_CHALLENGE_REQUEST 18
 #define MESSAGE_CHALLENGE_REPLY 19
+/* Babel-SIG (experimental): the ephemeral trust chain, a companion to the MAC
+   trailer. Carried in the trailer like MAC/PC. */
+#define MESSAGE_SIG_CERT 20
 
 /* Protocol extension through sub-TLVs. */
 #define SUBTLV_PAD1 0
