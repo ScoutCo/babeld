@@ -24,6 +24,12 @@ int x509_set_own(const unsigned char *der, int len);
 /* The stored own-certificate DER (for serving to peers), or NULL. */
 const unsigned char *x509_own_der(int *len_return);
 
+/* Copy this node's own raw 32-byte Ed25519 public key (extracted from the
+   configured own certificate, no chain validation) to pub_return, so the
+   daemon can recognise a CERT_REQUEST that targets its own identity. Returns 1
+   on success, 0 if no own certificate is configured or the key is not Ed25519. */
+int x509_own_pubkey(unsigned char *pub_return);
+
 /* Whether to enforce notBefore/notAfter. Off until the system clock is
    trusted (timesync/GPS), so a boot-time clock cannot black-hole routing. */
 void x509_set_enforce_time(int enforce);

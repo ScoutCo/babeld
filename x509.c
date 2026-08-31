@@ -87,6 +87,26 @@ x509_set_enforce_time(int enforce)
 }
 
 int
+x509_own_pubkey(unsigned char *pub_return)
+{
+    EVP_PKEY *pkey;
+    size_t rawlen = ED25519_PUBKEY_LEN;
+    int ok = 0;
+
+    if(own_cert == NULL)
+        return 0;
+    pkey = X509_get_pubkey(own_cert);
+    if(pkey == NULL || EVP_PKEY_get_base_id(pkey) != EVP_PKEY_ED25519)
+        goto done;
+    if(EVP_PKEY_get_raw_public_key(pkey, pub_return, &rawlen) == 1 &&
+       rawlen == ED25519_PUBKEY_LEN)
+        ok = 1;
+ done:
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+int
 x509_validate(const unsigned char *der, int len, unsigned char *pubkey_return)
 {
     const unsigned char *p = der;

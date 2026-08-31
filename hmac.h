@@ -55,6 +55,9 @@ THE SOFTWARE.
 void set_ca_pubkey(const unsigned char *pubkey);
 void set_own_cert(const unsigned char *cert);
 void set_ed25519_ephemeral(void);
+/* Opt in to on-demand certificate pull (X.509 mode): serve the cert only when
+   a peer sends a CERT_REQUEST, rather than pushing it periodically in Hellos. */
+void set_ed25519_cert_pull(void);
 int add_revoked_keyid(const unsigned char *keyid);
 
 /* X.509 identity mode (phase 3): the CA and own certificate, in DER. When
