@@ -21,9 +21,11 @@ THE SOFTWARE.
 */
 
 #define MAX_BUFFERED_UPDATES 200
-/* Room reserved for the auth trailer TLV: 2-byte TLV header + the widest
-   value (the 264-byte ephemeral-session Ed25519 trailer). */
-#define MAX_HMAC_SPACE 272
+/* Room reserved for the auth trailer TLVs. Large enough for the worst case:
+   a Hello carrying the fragmented X.509 certificate (a few ~255-byte
+   CERT_FRAG TLVs) plus the SIG_SESSION and MAC TLVs. Non-cert packets use
+   only a small fraction. */
+#define MAX_HMAC_SPACE 1024
 
 #define MESSAGE_PAD1 0
 #define MESSAGE_PADN 1
@@ -41,9 +43,16 @@ THE SOFTWARE.
 #define MESSAGE_PC 17
 #define MESSAGE_CHALLENGE_REQUEST 18
 #define MESSAGE_CHALLENGE_REPLY 19
-/* Babel-SIG (experimental): the ephemeral trust chain, a companion to the MAC
-   trailer. Carried in the trailer like MAC/PC. */
+/* Babel-SIG (experimental), all carried in the trailer like MAC/PC:
+   SIG_CERT   - minimal-cert ephemeral trust chain (phase 2b)
+   CERT_FRAG  - a fragment of this node's X.509 certificate (phase 3), sent in
+                Hellos periodically; a receiver concatenates the fragments in
+                one packet to reconstruct the DER
+   SIG_SESSION- X.509-mode session binding: long-term identity fingerprint +
+                ephemeral key + its authorization; references a cached cert */
 #define MESSAGE_SIG_CERT 20
+#define MESSAGE_CERT_FRAG 21
+#define MESSAGE_SIG_SESSION 22
 
 /* Protocol extension through sub-TLVs. */
 #define SUBTLV_PAD1 0

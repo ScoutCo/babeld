@@ -37,6 +37,7 @@ THE SOFTWARE.
 #include "neighbour.h"
 #include "util.h"
 #include "hmac.h"
+#include "x509.h"
 #include "configuration.h"
 #include "message.h"
 
@@ -123,6 +124,86 @@ session_lookup(const unsigned char *eph_keyid)
                 return NULL;
             return sessions[i].eph_pubkey;
         }
+    }
+    return NULL;
+}
+
+/* X.509 identity mode (phase 3). When a CA and an own certificate are both
+   configured, the node advertises its cert in Hellos (fragmented) and
+   authenticates peers by their cached, CA-validated certificate. */
+static int x509_ca_set = 0, x509_own_set = 0;
+
+int
+enable_x509_ca(const unsigned char *der, int len)
+{
+    if(!x509_set_ca(der, len))
+        return 0;
+    x509_ca_set = 1;
+    return 1;
+}
+
+int
+enable_x509_own(const unsigned char *der, int len)
+{
+    if(!x509_set_own(der, len))
+        return 0;
+    x509_own_set = 1;
+    return 1;
+}
+
+static int
+x509_mode(void)
+{
+    return x509_ca_set && x509_own_set;
+}
+
+/* X.509 mode always signs per-packet with an ephemeral key. */
+static int
+using_ephemeral(void)
+{
+    return ephemeral_enabled || x509_mode();
+}
+
+/* Peer identity cache: long-term identity fingerprint -> CA-validated raw
+   Ed25519 public key, populated when a peer's certificate is reassembled and
+   validated. Bounded, round-robin eviction. */
+#define MAX_IDENTITIES 512
+struct identity {
+    unsigned char fp[KEYID_LEN];
+    unsigned char pubkey[ED25519_PUBKEY_LEN];
+    int used;
+};
+static struct identity identities[MAX_IDENTITIES];
+static int identity_rr = 0;
+
+static void
+identity_upsert(const unsigned char *fp, const unsigned char *pubkey)
+{
+    int i, slot = -1;
+    for(i = 0; i < MAX_IDENTITIES; i++) {
+        if(identities[i].used && memcmp(identities[i].fp, fp, KEYID_LEN) == 0) {
+            slot = i;
+            break;
+        }
+        if(slot < 0 && !identities[i].used)
+            slot = i;
+    }
+    if(slot < 0)
+        slot = identity_rr++ % MAX_IDENTITIES;
+    memcpy(identities[slot].fp, fp, KEYID_LEN);
+    memcpy(identities[slot].pubkey, pubkey, ED25519_PUBKEY_LEN);
+    identities[slot].used = 1;
+}
+
+static const unsigned char *
+identity_lookup(const unsigned char *fp)
+{
+    int i;
+    if(keyid_revoked(fp))
+        return NULL;
+    for(i = 0; i < MAX_IDENTITIES; i++) {
+        if(identities[i].used && memcmp(identities[i].fp, fp, KEYID_LEN) == 0)
+            return identities[i].pubkey;
     }
     return NULL;
 }
@@ -436,10 +517,10 @@ sign_ed25519(const unsigned char *src, const unsigned char *dst,
     if(region == NULL)
         return -1;
 
-    if(own_cert_set && ephemeral_enabled) {
+    if(using_ephemeral()) {
         /* Ephemeral: the MAC value is keyid(ephemeral) || sig(ephemeral). The
-           trust chain travels separately in a SIG_CERT trailer TLV (the full
-           chain would exceed babeld's 255-byte trailer). */
+           trust chain (minimal SIG_CERT, or X.509 cert + SIG_SESSION) travels
+           separately in companion trailer TLVs. */
         if(ensure_ephemeral(key) != 0) {
             free(region);
             return -1;
@@ -487,6 +568,47 @@ build_sig_cert(struct key *key, unsigned char *value_return)
     return o;
 }
 
+/* Write the SIG_SESSION trailer value (X.509 mode): the node's long-term
+   identity fingerprint, its ephemeral public key, and the long-term key's
+   authorization of that ephemeral key. The identity fingerprint references a
+   certificate the receiver validated and cached from a CERT_FRAG. 104 bytes. */
+static int
+build_sig_session(struct key *key, unsigned char *value_return)
+{
+    if(ensure_ephemeral(key) != 0)
+        return -1;
+    memcpy(value_return, key->keyid, KEYID_LEN);
+    memcpy(value_return + KEYID_LEN, ephemeral_sk + 32, ED25519_PUBKEY_LEN);
+    memcpy(value_return + KEYID_LEN + ED25519_PUBKEY_LEN,
+           ephemeral_auth, ED25519_SIG_LEN);
+    return KEYID_LEN + ED25519_PUBKEY_LEN + ED25519_SIG_LEN;
+}
+
+/* Emit this node's X.509 certificate as consecutive CERT_FRAG trailer TLVs
+   (each value <= 240 bytes) starting at buf->buf[*i], advancing *i. Returns 0,
+   or -1 if it would overflow. */
+#define CERT_FRAG_MAX 240
+static int
+emit_cert_frags(struct buffered *buf, int *i)
+{
+    int derlen, off;
+    const unsigned char *der = x509_own_der(&derlen);
+    if(der == NULL || derlen <= 0)
+        return 0;
+    for(off = 0; off < derlen; off += CERT_FRAG_MAX) {
+        int frag = derlen - off;
+        if(frag > CERT_FRAG_MAX)
+            frag = CERT_FRAG_MAX;
+        if(*i + 2 + frag + 2 + MAX_DIGEST_LEN > buf->size)
+            return -1;
+        buf->buf[(*i)++] = MESSAGE_CERT_FRAG;
+        buf->buf[(*i)++] = frag;
+        memcpy(buf->buf + *i, der + off, frag);
+        *i += frag;
+    }
+    return 0;
+}
+
 /* Does the packet body contain a Hello TLV? The trust chain is attached only
    to such packets, so it travels at Hello cadence rather than on every
    packet. */
@@ -529,18 +651,34 @@ add_hmac(struct buffered *buf, struct interface *ifp,
         return -1;
     }
 
-    /* Ephemeral mode emits the trust chain in a companion SIG_CERT TLV ahead
-       of the MAC TLV — but only on packets carrying a Hello, so it travels at
-       Hello cadence. Receivers cache the validated ephemeral key and verify
-       the small MAC on all other packets against that cache. */
-    if(ifp->key->type == AUTH_TYPE_ED25519 && own_cert_set && ephemeral_enabled &&
-       body_has_hello(buf->buf, buf->len)) {
-        int certlen = build_sig_cert(ifp->key, buf->buf + i + 2);
-        if(certlen < 0)
-            return -1;
-        buf->buf[i++] = MESSAGE_SIG_CERT;
-        buf->buf[i++] = certlen;
-        i += certlen;
+    /* On Hellos, emit the trust material; other packets carry only the MAC and
+       verify against the receiver's caches. */
+    if(ifp->key->type == AUTH_TYPE_ED25519 && body_has_hello(buf->buf, buf->len)) {
+        if(x509_mode()) {
+            /* X.509: advertise the cert periodically (fragmented), and a
+               SIG_SESSION binding the ephemeral key on every Hello. */
+            static unsigned int hello_count = 0;
+            int slen;
+            hello_count++;
+            if(hello_count <= 3 || hello_count % 8 == 0) {
+                if(emit_cert_frags(buf, &i) < 0)
+                    return -1;
+            }
+            slen = build_sig_session(ifp->key, buf->buf + i + 2);
+            if(slen < 0)
+                return -1;
+            buf->buf[i++] = MESSAGE_SIG_SESSION;
+            buf->buf[i++] = slen;
+            i += slen;
+        } else if(own_cert_set && ephemeral_enabled) {
+            /* Minimal-cert ephemeral chain (phase 2b). */
+            int certlen = build_sig_cert(ifp->key, buf->buf + i + 2);
+            if(certlen < 0)
+                return -1;
+            buf->buf[i++] = MESSAGE_SIG_CERT;
+            buf->buf[i++] = certlen;
+            i += certlen;
+        }
     }
 
     if(ifp->key->type == AUTH_TYPE_ED25519)
@@ -718,6 +856,72 @@ verify_ed25519(const unsigned char *src, const unsigned char *dst,
     return 0;
 }
 
+#define SIG_SESSION_LEN (KEYID_LEN + ED25519_PUBKEY_LEN + ED25519_SIG_LEN)
+
+/* X.509 first pass: reassemble any certificate fragments in the packet and
+   cache the validated identity, then use a SIG_SESSION TLV to establish a
+   trusted ephemeral key (verified against that identity's cached key). On
+   success copies the ephemeral public key and returns 1. */
+static int
+process_x509_trailer(const unsigned char *packet, int packetlen, int bodylen,
+                     unsigned char *eph_pubkey_return)
+{
+    unsigned char der[4096];
+    int derlen = 0;
+    int i, len;
+
+    /* Reassemble the certificate from consecutive CERT_FRAG TLVs. */
+    for(i = bodylen + 4; i + 2 <= packetlen; i += len + 2) {
+        len = packet[i + 1];
+        if(i + len + 2 > packetlen)
+            break;
+        if(packet[i] == MESSAGE_CERT_FRAG) {
+            if(derlen + len > (int)sizeof(der))
+                break;
+            memcpy(der + derlen, packet + i + 2, len);
+            derlen += len;
+        }
+    }
+    if(derlen > 0) {
+        unsigned char pubkey[ED25519_PUBKEY_LEN], fp[KEYID_LEN];
+        if(x509_validate(der, derlen, pubkey) &&
+           compute_keyid(pubkey, fp) == 0 && !keyid_revoked(fp))
+            identity_upsert(fp, pubkey);
+    }
+
+    /* Bind the ephemeral key using the (now hopefully cached) identity. */
+    for(i = bodylen + 4; i + 2 <= packetlen; i += len + 2) {
+        len = packet[i + 1];
+        if(i + len + 2 > packetlen)
+            break;
+        if(packet[i] == MESSAGE_SIG_SESSION && len == SIG_SESSION_LEN) {
+            const unsigned char *fp = packet + i + 2;
+            const unsigned char *eph_pubkey = fp + KEYID_LEN;
+            const unsigned char *eph_auth = eph_pubkey + ED25519_PUBKEY_LEN;
+            const unsigned char *ltpub = identity_lookup(fp);
+            if(ltpub == NULL) {
+                debugf("SIG_SESSION from an identity whose cert is not cached "
+                       "yet.\n");
+                continue;
+            }
+            if(crypto_sign_ed25519_verify_detached(eph_auth, eph_pubkey,
+                                                   ED25519_PUBKEY_LEN,
+                                                   ltpub) != 0) {
+                debugf("Ephemeral key not authorized by the identity.\n");
+                continue;
+            }
+            {
+                unsigned char eph_keyid[KEYID_LEN];
+                if(compute_keyid(eph_pubkey, eph_keyid) == 0)
+                    session_upsert(eph_keyid, eph_pubkey, fp);
+            }
+            memcpy(eph_pubkey_return, eph_pubkey, ED25519_PUBKEY_LEN);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int
 check_hmac(const unsigned char *packet, int packetlen, int bodylen,
            const unsigned char *src, const unsigned char *dst,
@@ -733,9 +937,11 @@ check_hmac(const unsigned char *packet, int packetlen, int bodylen,
     debugf("check_hmac %s -> %s\n",
            format_address(src), format_address(dst));
 
-    /* First pass: a SIG_CERT trailer establishes a trusted ephemeral key for
-       the MAC in the same packet. */
-    if(ed25519) {
+    /* First pass: a SIG_CERT (minimal) or CERT_FRAG+SIG_SESSION (X.509)
+       trailer establishes a trusted ephemeral key for the MAC. */
+    if(ed25519 && x509_mode()) {
+        have_eph = process_x509_trailer(packet, packetlen, bodylen, eph_pubkey);
+    } else if(ed25519) {
         for(i = bodylen + 4; i + 2 <= packetlen; i += len + 2) {
             len = packet[i + 1];
             if(i + len + 2 > packetlen)
