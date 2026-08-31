@@ -41,6 +41,9 @@ THE SOFTWARE.
 #define MESSAGE_PC 17
 #define MESSAGE_CHALLENGE_REQUEST 18
 #define MESSAGE_CHALLENGE_REPLY 19
+/* Babel-SIG (experimental): the ephemeral trust chain, a companion to the MAC
+   trailer. Carried in the trailer like MAC/PC. */
+#define MESSAGE_SIG_CERT 20
 
 /* Protocol extension through sub-TLVs. */
 #define SUBTLV_PAD1 0

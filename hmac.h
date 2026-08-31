@@ -28,24 +28,28 @@ THE SOFTWARE.
    key. Not X.509 — a minimal binding that avoids ASN.1 in the daemon. */
 #define ED25519_CERT_LEN 64
 
-/* Three Ed25519 trailer layouts, distinguished by length:
+/* Ed25519 MAC trailer layouts, distinguished by length. babeld's trailer TLV
+   carries a one-byte length, so every value must fit in 255 bytes.
    - V1, phase 1 (preconfigured trusted keys): keyid || sig        = 72
    - V2, phase 2a (CA trust): keyid || pubkey || cert || sig       = 168
-   - V3, phase 2b (ephemeral session key):
-       keyid || long_term_pubkey || cert || eph_pubkey || eph_auth || sig = 264
-   In V2/V3 the signer's public key travels in the packet; the receiver trusts
-   it because `cert` verifies against the configured CA, so no per-peer config
-   is needed. In V3 the per-packet signature is by an ephemeral key the node
-   minted at startup, authorized once by the long-term key (`eph_auth`); the
-   long-term identity key never signs packets. */
+   Phase 2b (ephemeral) reuses the V1 MAC layout — keyid is the ephemeral key's
+   fingerprint and sig is by the ephemeral key — and carries the trust chain in
+   a companion SIG_CERT trailer TLV (below), because the full chain would blow
+   the 255-byte trailer limit. */
 #define ED25519_TRAILER_V1_LEN (KEYID_LEN + ED25519_SIG_LEN)
 #define ED25519_TRAILER_V2_LEN \
     (KEYID_LEN + ED25519_PUBKEY_LEN + ED25519_CERT_LEN + ED25519_SIG_LEN)
-#define ED25519_TRAILER_V3_LEN \
-    (ED25519_TRAILER_V2_LEN + ED25519_PUBKEY_LEN + ED25519_SIG_LEN)
+
+/* SIG_CERT trailer value (phase 2b): the two-link trust chain a receiver
+   needs to trust an ephemeral key, minus the per-packet signature.
+     long_term_pubkey || cert || eph_pubkey || eph_auth        = 192
+   cert = CA signature over long_term_pubkey; eph_auth = long-term signature
+   over eph_pubkey. Self-authenticating, so it need not be covered by the MAC. */
+#define ED25519_SIGCERT_LEN \
+    (ED25519_PUBKEY_LEN + ED25519_CERT_LEN + ED25519_PUBKEY_LEN + ED25519_SIG_LEN)
 
 /* Widest trailer value across all auth types (HMAC-SHA256 is 32). */
-#define MAX_DIGEST_LEN ED25519_TRAILER_V3_LEN
+#define MAX_DIGEST_LEN ED25519_SIGCERT_LEN
 
 /* Configured Ed25519 trust state (see hmac.c). */
 void set_ca_pubkey(const unsigned char *pubkey);
