@@ -40,7 +40,33 @@ THE SOFTWARE.
 #include "route.h"
 #include "kernel.h"
 #include "hmac.h"
+#include "x509.h"
 #include "configuration.h"
+
+/* Read a whole file into a freshly allocated buffer (used for DER certs). */
+static unsigned char *
+read_file_bytes(const char *path, int *len_return)
+{
+    FILE *f = fopen(path, "rb");
+    unsigned char *buf = NULL;
+    long size;
+    if(f == NULL)
+        return NULL;
+    if(fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0 ||
+       fseek(f, 0, SEEK_SET) != 0 || size > 1 << 20) {
+        fclose(f);
+        return NULL;
+    }
+    buf = malloc(size);
+    if(buf != NULL && fread(buf, 1, size, f) != (size_t)size) {
+        free(buf);
+        buf = NULL;
+    }
+    fclose(f);
+    if(buf != NULL)
+        *len_return = (int)size;
+    return buf;
+}
 
 static struct filter *input_filters = NULL;
 static struct filter *output_filters = NULL;
@@ -1302,6 +1328,37 @@ parse_config_line(int c, gnc_t gnc, void *closure,
            keeping the long-term identity key out of the per-packet path. */
         set_ed25519_ephemeral();
         c = skip_eol(c, gnc, closure);
+    } else if(strcmp(token, "ed25519-x509-ca") == 0 ||
+              strcmp(token, "ed25519-x509-cert") == 0) {
+        /* X.509 identity: the fleet CA certificate and this node's own
+           certificate, each read from a DER file. */
+        char *path = NULL;
+        unsigned char *der = NULL;
+        int len = 0, rc = 0;
+        c = getstring(c, &path, gnc, closure);
+        if(c < -1 || path == NULL)
+            goto fail;
+        der = read_file_bytes(path, &len);
+        free(path);
+        if(der == NULL) {
+            fprintf(stderr, "Couldn't read %s certificate file.\n", token);
+            goto fail;
+        }
+        if(strcmp(token, "ed25519-x509-ca") == 0)
+            rc = enable_x509_ca(der, len);
+        else
+            rc = enable_x509_own(der, len);
+        free(der);
+        if(!rc) {
+            fprintf(stderr, "Couldn't load %s certificate.\n", token);
+            goto fail;
+        }
+    } else if(strcmp(token, "ed25519-enforce-cert-time") == 0) {
+        int b;
+        c = getbool(c, &b, gnc, closure);
+        if(c < -1)
+            goto fail;
+        x509_set_enforce_time(b == CONFIG_YES);
     } else {
         c = parse_option(c, gnc, closure, token);
         if(c < -1)

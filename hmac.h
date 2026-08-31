@@ -57,6 +57,12 @@ void set_own_cert(const unsigned char *cert);
 void set_ed25519_ephemeral(void);
 int add_revoked_keyid(const unsigned char *keyid);
 
+/* X.509 identity mode (phase 3): the CA and own certificate, in DER. When
+   both are set the node distributes its cert in Hellos and authenticates
+   peers by cached, CA-validated certificate rather than an inline key. */
+int enable_x509_ca(const unsigned char *der, int len);
+int enable_x509_own(const unsigned char *der, int len);
+
 struct key *find_key(const char *id);
 struct key *find_key_by_keyid(const unsigned char *keyid);
 int compute_keyid(const unsigned char *pubkey, unsigned char *keyid_return);
