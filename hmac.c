@@ -55,6 +55,41 @@ static int own_cert_set = 0;
 static unsigned char (*revoked_keyids)[KEYID_LEN] = NULL;
 static int num_revoked = 0;
 
+/* Ephemeral session key (Babel-SIG phase 2b). When enabled, the node mints an
+   ephemeral keypair at first use and the long-term key authorizes it once
+   (eph_auth); packets are then signed by the ephemeral key so the long-term
+   identity key never appears in the per-packet hot path. A restart mints a
+   fresh ephemeral, giving a new session for free. */
+static int ephemeral_enabled = 0;
+static int have_ephemeral = 0;
+static unsigned char ephemeral_sk[ED25519_SECKEY_LEN];
+static unsigned char ephemeral_auth[ED25519_SIG_LEN];
+
+void
+set_ed25519_ephemeral(void)
+{
+    ephemeral_enabled = 1;
+}
+
+/* Mint the ephemeral keypair and have the long-term key authorize it. */
+static int
+ensure_ephemeral(const struct key *longterm)
+{
+    unsigned char ephemeral_pk[ED25519_PUBKEY_LEN];
+    if(have_ephemeral)
+        return 0;
+    if(longterm->len != ED25519_SECKEY_LEN)
+        return -1;
+    if(crypto_sign_ed25519_keypair(ephemeral_pk, ephemeral_sk) != 0)
+        return -1;
+    if(crypto_sign_ed25519_detached(ephemeral_auth, NULL,
+                                    ephemeral_pk, ED25519_PUBKEY_LEN,
+                                    longterm->value) != 0)
+        return -1;
+    have_ephemeral = 1;
+    return 0;
+}
+
 void
 set_ca_pubkey(const unsigned char *pubkey)
 {
@@ -351,8 +386,23 @@ sign_ed25519(const unsigned char *src, const unsigned char *dst,
         memcpy(value_return + o, own_cert, ED25519_CERT_LEN);
         o += ED25519_CERT_LEN;
     }
-    rc = crypto_sign_ed25519_detached(value_return + o, NULL,
-                                      region, regionlen, key->value);
+    if(own_cert_set && ephemeral_enabled) {
+        /* V3: carry the ephemeral public key and the long-term key's
+           authorization of it, then sign the packet with the ephemeral key. */
+        if(ensure_ephemeral(key) != 0) {
+            free(region);
+            return -1;
+        }
+        memcpy(value_return + o, ephemeral_sk + 32, ED25519_PUBKEY_LEN);
+        o += ED25519_PUBKEY_LEN;
+        memcpy(value_return + o, ephemeral_auth, ED25519_SIG_LEN);
+        o += ED25519_SIG_LEN;
+        rc = crypto_sign_ed25519_detached(value_return + o, NULL,
+                                          region, regionlen, ephemeral_sk);
+    } else {
+        rc = crypto_sign_ed25519_detached(value_return + o, NULL,
+                                          region, regionlen, key->value);
+    }
     free(region);
     if(rc != 0)
         return -1;
@@ -444,37 +494,56 @@ verify_ed25519(const unsigned char *src, const unsigned char *dst,
                const unsigned char *packet, int bodylen,
                const unsigned char *value, int valuelen)
 {
-    if(valuelen == ED25519_TRAILER_V2_LEN) {
+    if(valuelen == ED25519_TRAILER_V2_LEN || valuelen == ED25519_TRAILER_V3_LEN) {
         const unsigned char *keyid = value;
         const unsigned char *pubkey = value + KEYID_LEN;
         const unsigned char *cert = pubkey + ED25519_PUBKEY_LEN;
-        const unsigned char *sig = cert + ED25519_CERT_LEN;
         unsigned char expected_keyid[KEYID_LEN];
 
         if(!ca_set) {
             debugf("CA-trust packet but no CA configured.\n");
             return 0;
         }
+        /* Revocation is by identity: the long-term key, whose fingerprint is
+           the keyid. */
         if(keyid_revoked(keyid)) {
             debugf("Signature from revoked key id.\n");
             return 0;
         }
-        /* The keyid must be the fingerprint of the carried public key, so a
-           revocation by keyid cannot be dodged by presenting a mismatched
-           pubkey. */
+        /* The keyid must be the fingerprint of the carried long-term public
+           key, so a revocation by keyid cannot be dodged with a mismatched
+           key. */
         if(compute_keyid(pubkey, expected_keyid) != 0 ||
            memcmp(keyid, expected_keyid, KEYID_LEN) != 0) {
             debugf("Key id does not match public key.\n");
             return 0;
         }
-        /* The certificate is the CA's signature over the public key. */
+        /* The certificate is the CA's signature over the long-term key. */
         if(crypto_sign_ed25519_verify_detached(cert, pubkey,
                                                ED25519_PUBKEY_LEN,
                                                ca_pubkey) != 0) {
             debugf("Certificate not signed by the configured CA.\n");
             return 0;
         }
-        return verify_ed25519_sig(src, dst, packet, bodylen, sig, pubkey);
+
+        if(valuelen == ED25519_TRAILER_V2_LEN) {
+            const unsigned char *sig = cert + ED25519_CERT_LEN;
+            return verify_ed25519_sig(src, dst, packet, bodylen, sig, pubkey);
+        } else {
+            /* V3: the packet is signed by an ephemeral key that the long-term
+               key authorized. Verify that authorization, then the packet. */
+            const unsigned char *eph_pubkey = cert + ED25519_CERT_LEN;
+            const unsigned char *eph_auth = eph_pubkey + ED25519_PUBKEY_LEN;
+            const unsigned char *sig = eph_auth + ED25519_SIG_LEN;
+            if(crypto_sign_ed25519_verify_detached(eph_auth, eph_pubkey,
+                                                   ED25519_PUBKEY_LEN,
+                                                   pubkey) != 0) {
+                debugf("Ephemeral key not authorized by the long-term key.\n");
+                return 0;
+            }
+            return verify_ed25519_sig(src, dst, packet, bodylen, sig,
+                                      eph_pubkey);
+        }
     }
 
     if(valuelen == ED25519_TRAILER_V1_LEN) {

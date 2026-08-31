@@ -1297,6 +1297,11 @@ parse_config_line(int c, gnc_t gnc, void *closure,
         else
             add_revoked_keyid(value);
         free(value);
+    } else if(strcmp(token, "ed25519-ephemeral") == 0) {
+        /* Mint an ephemeral session key at startup and sign packets with it,
+           keeping the long-term identity key out of the per-packet path. */
+        set_ed25519_ephemeral();
+        c = skip_eol(c, gnc, closure);
     } else {
         c = parse_option(c, gnc, closure, token);
         if(c < -1)

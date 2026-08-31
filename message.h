@@ -22,8 +22,8 @@ THE SOFTWARE.
 
 #define MAX_BUFFERED_UPDATES 200
 /* Room reserved for the auth trailer TLV: 2-byte TLV header + the widest
-   value (the 168-byte CA-trust Ed25519 trailer). */
-#define MAX_HMAC_SPACE 176
+   value (the 264-byte ephemeral-session Ed25519 trailer). */
+#define MAX_HMAC_SPACE 272
 
 #define MESSAGE_PAD1 0
 #define MESSAGE_PADN 1
