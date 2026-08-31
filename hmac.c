@@ -208,6 +208,101 @@ identity_lookup(const unsigned char *fp)
     return NULL;
 }
 
+/* On-demand certificate pull (opt-in, X.509 mode). Instead of pushing the
+   certificate in every Nth Hello, a node advertises only its small session
+   binding and serves its certificate when a peer explicitly asks for it. */
+static int cert_pull_enabled = 0;
+
+void
+set_ed25519_cert_pull(void)
+{
+    cert_pull_enabled = 1;
+}
+
+/* This node's own identity fingerprint, so we can recognise a CERT_REQUEST
+   that targets us. Derived lazily from the configured own certificate. */
+static unsigned char own_fp[KEYID_LEN];
+static int own_fp_set = 0;
+
+static const unsigned char *
+own_identity_fp(void)
+{
+    unsigned char pub[ED25519_PUBKEY_LEN];
+    if(own_fp_set)
+        return own_fp;
+    if(x509_own_pubkey(pub) != 1)
+        return NULL;
+    if(compute_keyid(pub, own_fp) != 0)
+        return NULL;
+    own_fp_set = 1;
+    return own_fp;
+}
+
+/* Identities referenced by a peer (in a SIG_SESSION) whose certificate we do
+   not yet hold: we ask for these in our own Hellos, rate-limited per identity.
+   Serving our own certificate is likewise rate-limited. */
+#define MAX_WANTED 64
+#define CERT_REQUEST_INTERVAL 5   /* seconds between requests for one identity */
+#define CERT_SERVE_INTERVAL 5     /* seconds between servings of our own cert */
+struct wanted {
+    unsigned char fp[KEYID_LEN];
+    time_t last_req;
+    int used;
+};
+static struct wanted wanted[MAX_WANTED];
+static time_t cert_serve_due = 0;  /* a peer asked; serve on the next Hello */
+static time_t cert_served_at = 0;
+
+static void
+want_identity(const unsigned char *fp)
+{
+    int i, slot = -1;
+    for(i = 0; i < MAX_WANTED; i++) {
+        if(wanted[i].used && memcmp(wanted[i].fp, fp, KEYID_LEN) == 0)
+            return;                    /* already queued */
+        if(slot < 0 && !wanted[i].used)
+            slot = i;
+    }
+    if(slot < 0)
+        slot = 0;                      /* table full: reuse the first slot */
+    memcpy(wanted[slot].fp, fp, KEYID_LEN);
+    wanted[slot].last_req = 0;
+    wanted[slot].used = 1;
+}
+
+static void
+unwant_identity(const unsigned char *fp)
+{
+    int i;
+    for(i = 0; i < MAX_WANTED; i++)
+        if(wanted[i].used && memcmp(wanted[i].fp, fp, KEYID_LEN) == 0)
+            wanted[i].used = 0;
+}
+
+/* Emit a CERT_REQUEST trailer TLV (value = wanted identity fingerprint) for
+   each identity whose certificate we still lack, respecting the per-identity
+   rate limit. Starts writing at buf->buf[i]; returns the new offset. */
+static int
+emit_cert_requests(struct buffered *buf, int i)
+{
+    int w;
+    for(w = 0; w < MAX_WANTED; w++) {
+        if(!wanted[w].used)
+            continue;
+        if(wanted[w].last_req != 0 &&
+           now.tv_sec - wanted[w].last_req < CERT_REQUEST_INTERVAL)
+            continue;
+        if(i + 2 + KEYID_LEN + 2 + MAX_DIGEST_LEN > buf->size)
+            break;
+        buf->buf[i++] = MESSAGE_CERT_REQUEST;
+        buf->buf[i++] = KEYID_LEN;
+        memcpy(buf->buf + i, wanted[w].fp, KEYID_LEN);
+        i += KEYID_LEN;
+        wanted[w].last_req = now.tv_sec;
+    }
+    return i;
+}
+
 /* Mint the ephemeral keypair and have the long-term key authorize it. */
 static int
 ensure_ephemeral(const struct key *longterm)
@@ -655,14 +750,29 @@ add_hmac(struct buffered *buf, struct interface *ifp,
        verify against the receiver's caches. */
     if(ifp->key->type == AUTH_TYPE_ED25519 && body_has_hello(buf->buf, buf->len)) {
         if(x509_mode()) {
-            /* X.509: advertise the cert periodically (fragmented), and a
-               SIG_SESSION binding the ephemeral key on every Hello. */
-            static unsigned int hello_count = 0;
+            /* X.509: distribute the cert (fragmented) and bind the ephemeral
+               key with a SIG_SESSION on every Hello. The cert goes out either
+               periodically (push, the default) or only when a peer has asked
+               for it (pull), plus any CERT_REQUESTs we owe for peers we can't
+               yet authenticate. */
             int slen;
-            hello_count++;
-            if(hello_count <= 3 || hello_count % 8 == 0) {
-                if(emit_cert_frags(buf, &i) < 0)
-                    return -1;
+            if(cert_pull_enabled) {
+                if(cert_serve_due &&
+                   (cert_served_at == 0 ||
+                    now.tv_sec - cert_served_at >= CERT_SERVE_INTERVAL)) {
+                    if(emit_cert_frags(buf, &i) < 0)
+                        return -1;
+                    cert_serve_due = 0;
+                    cert_served_at = now.tv_sec;
+                }
+                i = emit_cert_requests(buf, i);
+            } else {
+                static unsigned int hello_count = 0;
+                hello_count++;
+                if(hello_count <= 3 || hello_count % 8 == 0) {
+                    if(emit_cert_frags(buf, &i) < 0)
+                        return -1;
+                }
             }
             slen = build_sig_session(ifp->key, buf->buf + i + 2);
             if(slen < 0)
@@ -870,23 +980,30 @@ process_x509_trailer(const unsigned char *packet, int packetlen, int bodylen,
     int derlen = 0;
     int i, len;
 
-    /* Reassemble the certificate from consecutive CERT_FRAG TLVs. */
+    /* Reassemble the certificate from consecutive CERT_FRAG TLVs, and note any
+       CERT_REQUEST that targets our own identity so we serve it next Hello. */
     for(i = bodylen + 4; i + 2 <= packetlen; i += len + 2) {
         len = packet[i + 1];
         if(i + len + 2 > packetlen)
             break;
         if(packet[i] == MESSAGE_CERT_FRAG) {
             if(derlen + len > (int)sizeof(der))
-                break;
+                continue;
             memcpy(der + derlen, packet + i + 2, len);
             derlen += len;
+        } else if(packet[i] == MESSAGE_CERT_REQUEST && len == KEYID_LEN) {
+            const unsigned char *ownfp = own_identity_fp();
+            if(ownfp != NULL && memcmp(packet + i + 2, ownfp, KEYID_LEN) == 0)
+                cert_serve_due = now.tv_sec;
         }
     }
     if(derlen > 0) {
         unsigned char pubkey[ED25519_PUBKEY_LEN], fp[KEYID_LEN];
         if(x509_validate(der, derlen, pubkey) &&
-           compute_keyid(pubkey, fp) == 0 && !keyid_revoked(fp))
+           compute_keyid(pubkey, fp) == 0 && !keyid_revoked(fp)) {
             identity_upsert(fp, pubkey);
+            unwant_identity(fp);       /* we hold this cert now; stop asking */
+        }
     }
 
     /* Bind the ephemeral key using the (now hopefully cached) identity. */
@@ -902,6 +1019,9 @@ process_x509_trailer(const unsigned char *packet, int packetlen, int bodylen,
             if(ltpub == NULL) {
                 debugf("SIG_SESSION from an identity whose cert is not cached "
                        "yet.\n");
+                /* Ask for it (served on our next Hello); harmless in push mode
+                   where the cert arrives on its own. */
+                want_identity(fp);
                 continue;
             }
             if(crypto_sign_ed25519_verify_detached(eph_auth, eph_pubkey,

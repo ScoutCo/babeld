@@ -49,10 +49,15 @@ THE SOFTWARE.
                 Hellos periodically; a receiver concatenates the fragments in
                 one packet to reconstruct the DER
    SIG_SESSION- X.509-mode session binding: long-term identity fingerprint +
-                ephemeral key + its authorization; references a cached cert */
+                ephemeral key + its authorization; references a cached cert
+   CERT_REQUEST- on-demand cert pull: value is an identity fingerprint; the
+                node holding that identity serves its cert (as CERT_FRAGs) on
+                its next Hello. Processed before the MAC, since the pull has to
+                bootstrap before either side can verify the other's session. */
 #define MESSAGE_SIG_CERT 20
 #define MESSAGE_CERT_FRAG 21
 #define MESSAGE_SIG_SESSION 22
+#define MESSAGE_CERT_REQUEST 23
 
 /* Protocol extension through sub-TLVs. */
 #define SUBTLV_PAD1 0

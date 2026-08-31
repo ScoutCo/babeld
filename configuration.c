@@ -1328,6 +1328,11 @@ parse_config_line(int c, gnc_t gnc, void *closure,
            keeping the long-term identity key out of the per-packet path. */
         set_ed25519_ephemeral();
         c = skip_eol(c, gnc, closure);
+    } else if(strcmp(token, "ed25519-cert-pull") == 0) {
+        /* Serve the X.509 certificate on demand (in response to a
+           CERT_REQUEST) rather than pushing it periodically in Hellos. */
+        set_ed25519_cert_pull();
+        c = skip_eol(c, gnc, closure);
     } else if(strcmp(token, "ed25519-x509-ca") == 0 ||
               strcmp(token, "ed25519-x509-cert") == 0) {
         /* X.509 identity: the fleet CA certificate and this node's own
