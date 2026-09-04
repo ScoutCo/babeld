@@ -1137,16 +1137,28 @@ flushbuf(struct buffered *buf, struct interface *ifp)
 
     if(buf->len > 0) {
         int probe;
-        if(ifp->key != NULL && ifp->key->type != AUTH_TYPE_NONE)
-            send_pc(buf, ifp);
+        if(ifp->key != NULL && ifp->key->type != AUTH_TYPE_NONE) {
+            if(send_pc(buf, ifp) < 0) {
+                /* Couldn't append the packet counter (buffer full). Sending
+                   without it would just be rejected as unauthenticated, so drop
+                   the packet -- but fall through to reset the buffer below.
+                   Returning here would leave buf->len untouched, wedging the
+                   buffer full so every later flush fails the same way. */
+                goto done;
+            }
+        }
         debugf("  (flushing %d buffered bytes)\n", buf->len);
         DO_HTONS(packet_header + 2, buf->len);
         fill_rtt_message(buf, ifp);
         if(ifp->key != NULL && ifp->key->type != AUTH_TYPE_NONE) {
             end = add_hmac(buf, ifp, packet_header);
             if(end < 0) {
+                /* Signing failed (e.g. no link-local yet during bring-up). Drop
+                   this packet, but still reset the buffer below: the original
+                   `return` left it full, so it wedged and flooded add_hmac /
+                   send_pc errors indefinitely and starved real traffic. */
                 fprintf(stderr, "Couldn't add HMAC.\n");
-                return;
+                goto done;
             }
         }
         probe = (ifp->flags & IF_PROBE_MTU) != 0 && ifp->buf.hello >= 0;
@@ -1179,6 +1191,7 @@ flushbuf(struct buffered *buf, struct interface *ifp)
         if(rc < 0)
             perror("send");
     }
+ done:
     VALGRIND_MAKE_MEM_UNDEFINED(buf->buf, buf->size);
     buf->len = 0;
     buf->hello = -1;

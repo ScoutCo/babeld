@@ -67,10 +67,40 @@ static unsigned char ephemeral_sk[ED25519_SECKEY_LEN];
 static unsigned char ephemeral_auth[ED25519_SIG_LEN];
 static unsigned char ephemeral_keyid[KEYID_LEN];
 
+/* Network name folded into every ephemeral authorization. In cert-less mode it
+   is the only thing scoping peering: a peer whose configured name differs
+   produces an eph_auth that will not verify here, so its session is dropped.
+   The name never travels on the wire. */
+static unsigned char network_name[MAX_NETWORK_NAME];
+static int network_name_len = 0;
+
 void
 set_ed25519_ephemeral(void)
 {
     ephemeral_enabled = 1;
+}
+
+void
+set_ed25519_network_name(const char *name)
+{
+    int len = name == NULL ? 0 : (int)strlen(name);
+    if(len > MAX_NETWORK_NAME)
+        len = MAX_NETWORK_NAME;
+    memcpy(network_name, name, len);
+    network_name_len = len;
+}
+
+/* The message the long-term key signs to authorize an ephemeral key: the
+   ephemeral public key, then the configured network name. Verifiers rebuild it
+   with their own name, so a session verifies only within one named network.
+   out must hold ED25519_PUBKEY_LEN + MAX_NETWORK_NAME bytes. Returns its length. */
+static int
+eph_auth_message(const unsigned char *eph_pubkey, unsigned char *out)
+{
+    memcpy(out, eph_pubkey, ED25519_PUBKEY_LEN);
+    if(network_name_len > 0)
+        memcpy(out + ED25519_PUBKEY_LEN, network_name, network_name_len);
+    return ED25519_PUBKEY_LEN + network_name_len;
 }
 
 /* Session cache: validated ephemeral keys, so that steady-state packets can
@@ -162,6 +192,15 @@ static int
 using_ephemeral(void)
 {
     return ephemeral_enabled || x509_mode();
+}
+
+/* Cert-less mode: ephemeral signing with no certificate trust at all (no CA,
+   no X.509, no own cert). Sessions are self-consistent and scoped by network
+   name; membership is open. Provides packet integrity + network-name scoping. */
+static int
+certless_mode(void)
+{
+    return ephemeral_enabled && !ca_set && !own_cert_set && !x509_ca_set;
 }
 
 /* Peer identity cache: long-term identity fingerprint -> CA-validated raw
@@ -303,20 +342,23 @@ emit_cert_requests(struct buffered *buf, int i)
     return i;
 }
 
-/* Mint the ephemeral keypair and have the long-term key authorize it. */
+/* Mint the ephemeral keypair and have the long-term key authorize it (over the
+   ephemeral key and the network name). */
 static int
 ensure_ephemeral(const struct key *longterm)
 {
     unsigned char ephemeral_pk[ED25519_PUBKEY_LEN];
+    unsigned char msg[ED25519_PUBKEY_LEN + MAX_NETWORK_NAME];
+    int msglen;
     if(have_ephemeral)
         return 0;
     if(longterm->len != ED25519_SECKEY_LEN)
         return -1;
     if(crypto_sign_ed25519_keypair(ephemeral_pk, ephemeral_sk) != 0)
         return -1;
+    msglen = eph_auth_message(ephemeral_pk, msg);
     if(crypto_sign_ed25519_detached(ephemeral_auth, NULL,
-                                    ephemeral_pk, ED25519_PUBKEY_LEN,
-                                    longterm->value) != 0)
+                                    msg, msglen, longterm->value) != 0)
         return -1;
     if(compute_keyid(ephemeral_pk, ephemeral_keyid) != 0)
         return -1;
@@ -679,6 +721,23 @@ build_sig_session(struct key *key, unsigned char *value_return)
     return KEYID_LEN + ED25519_PUBKEY_LEN + ED25519_SIG_LEN;
 }
 
+/* Write the SIG_NET trailer value (cert-less mode): the node's long-term
+   public key, its ephemeral public key, and the long-term key's authorization
+   of the ephemeral key (which also covers the network name). No certificate.
+   128 bytes. */
+static int
+build_sig_net(struct key *key, unsigned char *value_return)
+{
+    if(ensure_ephemeral(key) != 0)
+        return -1;
+    memcpy(value_return, key->value + 32, ED25519_PUBKEY_LEN);
+    memcpy(value_return + ED25519_PUBKEY_LEN, ephemeral_sk + 32,
+           ED25519_PUBKEY_LEN);
+    memcpy(value_return + 2 * ED25519_PUBKEY_LEN, ephemeral_auth,
+           ED25519_SIG_LEN);
+    return ED25519_SIGNET_LEN;
+}
+
 /* Emit this node's X.509 certificate as consecutive CERT_FRAG trailer TLVs
    (each value <= 240 bytes) starting at buf->buf[*i], advancing *i. Returns 0,
    or -1 if it would overflow. */
@@ -788,6 +847,14 @@ add_hmac(struct buffered *buf, struct interface *ifp,
             buf->buf[i++] = MESSAGE_SIG_CERT;
             buf->buf[i++] = certlen;
             i += certlen;
+        } else if(certless_mode()) {
+            /* Cert-less: a SIG_NET session binding, no certificate. */
+            int nlen = build_sig_net(ifp->key, buf->buf + i + 2);
+            if(nlen < 0)
+                return -1;
+            buf->buf[i++] = MESSAGE_SIG_NET;
+            buf->buf[i++] = nlen;
+            i += nlen;
         }
     }
 
@@ -874,11 +941,16 @@ validate_sig_cert(const unsigned char *value, int valuelen,
         debugf("Certificate not signed by the configured CA.\n");
         return 0;
     }
-    /* eph_auth = long-term key's authorization of the ephemeral key. */
-    if(crypto_sign_ed25519_verify_detached(eph_auth, eph_pubkey,
-                                           ED25519_PUBKEY_LEN, pubkey) != 0) {
-        debugf("Ephemeral key not authorized by the long-term key.\n");
-        return 0;
+    /* eph_auth = long-term key's authorization of the ephemeral key and the
+       network name. */
+    {
+        unsigned char msg[ED25519_PUBKEY_LEN + MAX_NETWORK_NAME];
+        int msglen = eph_auth_message(eph_pubkey, msg);
+        if(crypto_sign_ed25519_verify_detached(eph_auth, msg, msglen,
+                                               pubkey) != 0) {
+            debugf("Ephemeral key not authorized by the long-term key.\n");
+            return 0;
+        }
     }
     /* Cache the validated ephemeral key so later MAC-only packets from this
        session need not re-carry the chain. */
@@ -1024,16 +1096,59 @@ process_x509_trailer(const unsigned char *packet, int packetlen, int bodylen,
                 want_identity(fp);
                 continue;
             }
-            if(crypto_sign_ed25519_verify_detached(eph_auth, eph_pubkey,
-                                                   ED25519_PUBKEY_LEN,
-                                                   ltpub) != 0) {
-                debugf("Ephemeral key not authorized by the identity.\n");
-                continue;
+            {
+                unsigned char msg[ED25519_PUBKEY_LEN + MAX_NETWORK_NAME];
+                int msglen = eph_auth_message(eph_pubkey, msg);
+                if(crypto_sign_ed25519_verify_detached(eph_auth, msg, msglen,
+                                                       ltpub) != 0) {
+                    debugf("Ephemeral key not authorized by the identity.\n");
+                    continue;
+                }
             }
             {
                 unsigned char eph_keyid[KEYID_LEN];
                 if(compute_keyid(eph_pubkey, eph_keyid) == 0)
                     session_upsert(eph_keyid, eph_pubkey, fp);
+            }
+            memcpy(eph_pubkey_return, eph_pubkey, ED25519_PUBKEY_LEN);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Cert-less first pass: find a SIG_NET trailer and, if the long-term key it
+   carries authorized the ephemeral key over our network name, cache the
+   ephemeral key and return it. A name mismatch (or a tampered binding) fails
+   verification, so the session -- and every packet it would authenticate -- is
+   dropped. Membership is otherwise open: any self-consistent binding is
+   accepted. On success copies the ephemeral public key and returns 1. */
+static int
+process_sig_net(const unsigned char *packet, int packetlen, int bodylen,
+                unsigned char *eph_pubkey_return)
+{
+    int i, len;
+    for(i = bodylen + 4; i + 2 <= packetlen; i += len + 2) {
+        len = packet[i + 1];
+        if(i + len + 2 > packetlen)
+            break;
+        if(packet[i] == MESSAGE_SIG_NET && len == ED25519_SIGNET_LEN) {
+            const unsigned char *ltpub = packet + i + 2;
+            const unsigned char *eph_pubkey = ltpub + ED25519_PUBKEY_LEN;
+            const unsigned char *eph_auth = eph_pubkey + ED25519_PUBKEY_LEN;
+            unsigned char msg[ED25519_PUBKEY_LEN + MAX_NETWORK_NAME];
+            int msglen = eph_auth_message(eph_pubkey, msg);
+            if(crypto_sign_ed25519_verify_detached(eph_auth, msg, msglen,
+                                                   ltpub) != 0) {
+                debugf("Cert-less session failed authorization "
+                       "(bad key or network-name mismatch).\n");
+                continue;
+            }
+            {
+                unsigned char eph_keyid[KEYID_LEN], lt_keyid[KEYID_LEN];
+                if(compute_keyid(eph_pubkey, eph_keyid) == 0 &&
+                   compute_keyid(ltpub, lt_keyid) == 0)
+                    session_upsert(eph_keyid, eph_pubkey, lt_keyid);
             }
             memcpy(eph_pubkey_return, eph_pubkey, ED25519_PUBKEY_LEN);
             return 1;
@@ -1057,10 +1172,13 @@ check_hmac(const unsigned char *packet, int packetlen, int bodylen,
     debugf("check_hmac %s -> %s\n",
            format_address(src), format_address(dst));
 
-    /* First pass: a SIG_CERT (minimal) or CERT_FRAG+SIG_SESSION (X.509)
-       trailer establishes a trusted ephemeral key for the MAC. */
+    /* First pass: a SIG_CERT (minimal), CERT_FRAG+SIG_SESSION (X.509), or
+       SIG_NET (cert-less) trailer establishes a trusted ephemeral key for the
+       MAC. */
     if(ed25519 && x509_mode()) {
         have_eph = process_x509_trailer(packet, packetlen, bodylen, eph_pubkey);
+    } else if(ed25519 && certless_mode()) {
+        have_eph = process_sig_net(packet, packetlen, bodylen, eph_pubkey);
     } else if(ed25519) {
         for(i = bodylen + 4; i + 2 <= packetlen; i += len + 2) {
             len = packet[i + 1];

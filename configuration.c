@@ -1333,6 +1333,15 @@ parse_config_line(int c, gnc_t gnc, void *closure,
            CERT_REQUEST) rather than pushing it periodically in Hellos. */
         set_ed25519_cert_pull();
         c = skip_eol(c, gnc, closure);
+    } else if(strcmp(token, "ed25519-network-name") == 0) {
+        /* Network name folded into ephemeral authorizations. In cert-less mode
+           it scopes peering to nodes sharing the same name. */
+        char *name = NULL;
+        c = getstring(c, &name, gnc, closure);
+        if(c < -1 || name == NULL)
+            goto fail;
+        set_ed25519_network_name(name);
+        free(name);
     } else if(strcmp(token, "ed25519-x509-ca") == 0 ||
               strcmp(token, "ed25519-x509-cert") == 0) {
         /* X.509 identity: the fleet CA certificate and this node's own
